@@ -2,48 +2,16 @@ import ast
 import argparse
 import sys
 from pathlib import Path
-from typing import NamedTuple, Union, Text, Tuple, List
+from typing import NamedTuple, Text, Tuple, List, Optional
 
 import graphviz
-
-COLORS = [
-    "black",
-    "cadetblue4",
-    "coral4",
-    "cornflowerblue",
-    "darkcyan",
-    "darkgreen",
-    "darkolivegreen",
-    "darksalmon",
-    "darkseagreen",
-    "deeppink",
-    "fuchsia",
-    "gold4",
-    "lightsalmon3",
-    "magenta",
-    "maroon1",
-    "navyblue",
-    "olive",
-    "orange2",
-    "orchid",
-    "purple",
-    "red3",
-    "springgreen3",
-    "tan1",
-    "teal",
-    "thistle",
-    "tomato1",
-    "violetred",
-    "webpurple",
-    "wheat3",
-    "yellowgreen",
-]
 
 
 class Revision(NamedTuple):
     identifier: Text
-    down_revision: Union[Tuple[Text, ...], Text]
+    down_revision: Tuple[Optional[Text], ...]
     filename: Path
+    labels: List[Text]
 
     @staticmethod
     def from_ast_node(node: ast.AST, filename: Path):
@@ -67,7 +35,19 @@ class Revision(NamedTuple):
         if not identifier:
             raise ValueError("Unable to find revision identifier.")
 
-        return Revision(identifier, down_revision, filename)
+        if not isinstance(down_revision, tuple):
+            down_revision = (down_revision,)
+
+        return Revision(identifier, down_revision, filename, [])
+
+    def identity(self) -> Text:
+        return str(hash((self.identifier,) + tuple(sorted(self.down_revision))))
+
+    def is_initial(self) -> bool:
+        return self.down_revision == (None,)
+
+    def is_merge(self) -> bool:
+        return len(self.down_revision) > 1
 
 
 def print_err(*args, **kwargs) -> None:
@@ -101,30 +81,63 @@ def read_revisions(versions: Path) -> List[Revision]:
     return revisions
 
 
-def create_graph(revisions: List[Revision]) -> graphviz.Digraph:
-    dot = graphviz.Digraph(name="migrations")
+def flatten_groups(
+    revision_groups: List[List[Revision]], dir_labels: List[Text]
+) -> List[Revision]:
+    result = {}
+
+    for i, revisions in enumerate(revision_groups):
+        for revision in revisions:
+            final_rev = result.setdefault(revision.identity(), revision)
+
+            if dir_labels:
+                final_rev.labels.append(dir_labels[i])
+
+    return list(result.values())
+
+
+def create_graph(
+    name: Text,
+    revision_groups: List[Revision],
+    dir_labels: List[Text],
+    short_node_labels: bool,
+    reverse: bool,
+) -> graphviz.Digraph:
+    dot = graphviz.Digraph(name=name)
+
+    if reverse:
+        # Ensure initial migration is placed at the bottom even when digraph is
+        # reversed.
+        dot.attr("graph", rankdir="BT")
+
+    revisions = flatten_groups(revision_groups, dir_labels)
 
     for revision in revisions:
-        color = COLORS[hash(revision.identifier) % len(COLORS)]
-
-        dot.attr("node", color=color)
-        dot.attr("node", peripheries="1" if revision.down_revision else "2")
+        dot.attr("node", peripheries="2" if revision.is_initial() else "1")
         dot.attr(
-            "node", shape="box" if isinstance(revision.down_revision, tuple) else "oval"
+            "node", shape="box" if revision.is_merge() else "oval",
         )
 
-        dot.node(revision.identifier, label=revision.filename.stem)
+        label = revision.identifier if short_node_labels else revision.filename.stem
+        if revision.labels:
+            label += "\n" + ", ".join(revision.labels)
+
+        dot.node(revision.identity(), label=label)
 
     for revision in revisions:
-        down_revision = revision.down_revision
-        if not down_revision:
+        if revision.is_initial():
             continue
 
-        if isinstance(down_revision, str):
-            down_revision = (down_revision,)
+        for entry in revision.down_revision:
+            for candidate in revisions:
+                if candidate.identifier != entry:
+                    continue
 
-        for entry in down_revision:
-            dot.edge(revision.identifier, entry)
+                edge = [revision.identity(), candidate.identity()]
+                if reverse:
+                    edge.reverse()
+
+                dot.edge(*edge)
 
     return dot
 
@@ -132,7 +145,14 @@ def create_graph(revisions: List[Revision]) -> graphviz.Digraph:
 def read_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("versions", type=Path, metavar="VERSIONS-DIRECTORY")
+    parser.add_argument(
+        "version_dirs", type=Path, metavar="VERSIONS-DIRECTORY", nargs="+"
+    )
+
+    parser.add_argument("--short-node-labels", action="store_true")
+    parser.add_argument("--dir-labels", nargs="+", metavar="LABEL")
+    parser.add_argument("--output", type=Path, metavar="PATH", default="output.png")
+    parser.add_argument("--reverse", action="store_true")
 
     return parser.parse_args()
 
@@ -140,13 +160,33 @@ def read_args() -> argparse.Namespace:
 def main() -> None:
     args = read_args()
 
-    if not args.versions.is_dir():
-        print_err(f"Error: '{args.versions}' is not a directory.")
+    revision_groups = []
 
-    revisions = read_revisions(args.versions)
-    dot = create_graph(revisions)
+    if args.dir_labels and len(args.dir_labels) != len(args.version_dirs):
+        print_err(
+            f"Error: You must provide exactly one directory label for each version "
+            f"directory (want: {len(args.version_dirs)}, got: {len(args.dir_labels)})."
+        )
 
-    dot.render(format="png")
+    if not args.output.suffix:
+        print_err("Error: Output file path must contain an extension (e.g. '.png').")
+
+    for version_dir in args.version_dirs:
+        if not version_dir.is_dir():
+            print_err(f"Error: '{args.versions}' is not a directory.")
+
+        revision_groups.append(read_revisions(version_dir))
+
+    dot = create_graph(
+        args.output.stem,
+        revision_groups,
+        args.dir_labels,
+        args.short_node_labels,
+        args.reverse,
+    )
+
+    filename = args.output.parent / args.output.stem
+    dot.render(filename=filename, format=args.output.suffix[1:], cleanup=True)
 
 
 if __name__ == "__main__":
